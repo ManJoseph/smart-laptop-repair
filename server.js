@@ -48,6 +48,10 @@ const aiDiagnose = (desc) => {
 
 // ─── API Routes ───────────────────────────────────────────
 
+app.get('/', (req, res) => {
+  res.send('Smart Laptop Repair API is running.');
+});
+
 // LOGIN – now uses bcrypt compare
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
@@ -281,5 +285,8 @@ app.get('/api/export/suppliers', (req, res) => {
     .then(result => sendExcel(res, result.rows, 'Suppliers', 'SLR_Suppliers'))
     .catch(err => res.status(500).json({ error: err.message }));
 });
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => console.log(`🚀 SLR server running on port ${PORT}`));
+}
 
-app.listen(PORT, () => console.log(`🚀 SLR server running on port ${PORT}`));
+module.exports = app;
