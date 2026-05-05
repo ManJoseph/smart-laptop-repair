@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const XLSX = require('xlsx');
 const path = require('path');
@@ -12,84 +12,25 @@ const SALT_ROUNDS = 10;
 app.use(cors());
 app.use(express.json());
 
-// ─── Database ────────────────────────────────────────────
-const db = new sqlite3.Database('./slr.db', (err) => {
-  if (err) { console.error('DB error:', err); }
-  else { console.log('✅ Connected to SQLite.'); initDatabase(); }
+// ─── PostgreSQL Database ───────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
 });
 
-function initDatabase() {
-  db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('customer','technician','admin'))
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS suppliers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      contact TEXT DEFAULT '',
-      email TEXT DEFAULT '',
-      address TEXT DEFAULT ''
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS parts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      stock_level INTEGER DEFAULT 0,
-      cost REAL NOT NULL DEFAULT 0,
-      supplier_id INTEGER,
-      FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS repairs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      customer_id INTEGER,
-      technician_id INTEGER,
-      device_model TEXT NOT NULL,
-      problem_description TEXT NOT NULL,
-      status TEXT DEFAULT 'Pending' CHECK(status IN ('Pending','Diagnosing','Fixing','Completed','Cancelled')),
-      notes TEXT DEFAULT '',
-      cost REAL DEFAULT 0.0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(customer_id) REFERENCES users(id),
-      FOREIGN KEY(technician_id) REFERENCES users(id)
-    )`);
-
-    // Seed admin users with hashed passwords
-    db.get("SELECT COUNT(*) AS count FROM users WHERE role='admin'", async (err, row) => {
-      if (row && row.count === 0) {
-        const adminHash = await bcrypt.hash('admin123', SALT_ROUNDS);
-        const techHash  = await bcrypt.hash('tech123',  SALT_ROUNDS);
-        const custHash  = await bcrypt.hash('client123', SALT_ROUNDS);
-        db.run(`INSERT INTO users (name,email,password,role) VALUES ('Admin','admin@slr.com',?,'admin')`, [adminHash]);
-        db.run(`INSERT INTO users (name,email,password,role) VALUES ('Tech 1','tech@slr.com',?,'technician')`, [techHash]);
-        db.run(`INSERT INTO users (name,email,password,role) VALUES ('Customer A','customer@slr.com',?,'customer')`, [custHash]);
-      }
-    });
-
-    db.get("SELECT COUNT(*) AS count FROM suppliers", (err, row) => {
-      if (row && row.count === 0) {
-        db.run(`INSERT INTO suppliers (name,contact,email,address) VALUES ('TechParts Rwanda','+250788000001','info@techparts.rw','Kigali, Rwanda')`);
-        db.run(`INSERT INTO suppliers (name,contact,email,address) VALUES ('LaptopSpares Ltd','+250788000002','sales@laptopspares.com','Nairobi, Kenya')`);
-      }
-    });
-
-    db.get("SELECT COUNT(*) AS count FROM parts", (err, row) => {
-      if (row && row.count === 0) {
-        db.run(`INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES ('Screen 15.6"',5,80.00,1)`);
-        db.run(`INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES ('Battery 6-cell',10,45.00,1)`);
-        db.run(`INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES ('Thermal Paste',50,10.00,2)`);
-        db.run(`INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES ('Cooling Fan',12,25.00,2)`);
-        db.run(`INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES ('RAM 8GB DDR4',8,35.00,1)`);
-        db.run(`INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES ('SSD 256GB',6,60.00,2)`);
-      }
-    });
-  });
+async function query(text, params) {
+  const client = await pool.connect();
+  try {
+    const res = await client.query(text, params);
+    return res;
+  } finally {
+    client.release();
+  }
 }
+
+// NOTE: You must manually create your tables in PostgreSQL. See README for schema.
+// Optionally, you can add a migration script to create tables and seed data.
+console.log('✅ Connected to PostgreSQL.');
 
 // ─── AI Diagnosis Module ──────────────────────────────────
 const aiDiagnose = (desc) => {
@@ -110,14 +51,16 @@ const aiDiagnose = (desc) => {
 // LOGIN – now uses bcrypt compare
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
-  db.get('SELECT * FROM users WHERE email = ?', [email], async (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(401).json({ error: 'Invalid credentials' });
-    const match = await bcrypt.compare(password, row.password);
-    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
-    const { password: _pw, ...user } = row; // never send password to client
-    res.json({ user });
-  });
+  query('SELECT * FROM users WHERE email = $1', [email])
+    .then(async result => {
+      const row = result.rows[0];
+      if (!row) return res.status(401).json({ error: 'Invalid credentials' });
+      const match = await bcrypt.compare(password, row.password);
+      if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+      const { password: _pw, ...user } = row;
+      res.json({ user });
+    })
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 // REGISTER – hashes password before storing
@@ -125,196 +68,182 @@ app.post('/api/register', async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  db.get('SELECT id FROM users WHERE email = ?', [email], async (err, existing) => {
-    if (existing) return res.status(409).json({ error: 'Email already registered' });
-    const hashed = await bcrypt.hash(password, SALT_ROUNDS);
-    db.run('INSERT INTO users (name,email,password,role) VALUES (?,?,?,?)',
-      [name, email, hashed, 'customer'], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ user: { id: this.lastID, name, email, role: 'customer' } });
-    });
-  });
+  query('SELECT id FROM users WHERE email = $1', [email])
+    .then(async result => {
+      if (result.rows.length > 0) return res.status(409).json({ error: 'Email already registered' });
+      const hashed = await bcrypt.hash(password, SALT_ROUNDS);
+      const insertRes = await query('INSERT INTO users (name,email,password,role) VALUES ($1,$2,$3,$4) RETURNING id',
+        [name, email, hashed, 'customer']);
+      res.json({ user: { id: insertRes.rows[0].id, name, email, role: 'customer' } });
+    })
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 // PARTS
 app.get('/api/parts', (req, res) => {
-  db.all('SELECT p.*, s.name as supplier_name FROM parts p LEFT JOIN suppliers s ON p.supplier_id = s.id', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+  query('SELECT p.*, s.name as supplier_name FROM parts p LEFT JOIN suppliers s ON p.supplier_id = s.id')
+    .then(result => res.json(result.rows))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.post('/api/parts', (req, res) => {
   const { name, stock_level, cost, supplier_id } = req.body;
-  db.run('INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES (?,?,?,?)',
-    [name, stock_level || 0, cost || 0, supplier_id || null], function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true, id: this.lastID });
-  });
+  query('INSERT INTO parts (name,stock_level,cost,supplier_id) VALUES ($1,$2,$3,$4) RETURNING id',
+    [name, stock_level || 0, cost || 0, supplier_id || null])
+    .then(result => res.json({ success: true, id: result.rows[0].id }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.put('/api/parts/:id', (req, res) => {
   const { stock_level, cost, supplier_id } = req.body;
-  db.run('UPDATE parts SET stock_level=COALESCE(?,stock_level), cost=COALESCE(?,cost), supplier_id=COALESCE(?,supplier_id) WHERE id=?',
-    [stock_level, cost, supplier_id, req.params.id], function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true });
-  });
+  query('UPDATE parts SET stock_level=COALESCE($1,stock_level), cost=COALESCE($2,cost), supplier_id=COALESCE($3,supplier_id) WHERE id=$4',
+    [stock_level, cost, supplier_id, req.params.id])
+    .then(() => res.json({ success: true }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.delete('/api/parts/:id', (req, res) => {
-  db.run('DELETE FROM parts WHERE id=?', [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
-  });
+  query('DELETE FROM parts WHERE id=$1', [req.params.id])
+    .then(() => res.json({ success: true }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 // SUPPLIERS
 app.get('/api/suppliers', (req, res) => {
-  db.all('SELECT * FROM suppliers ORDER BY name', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+  query('SELECT * FROM suppliers ORDER BY name')
+    .then(result => res.json(result.rows))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.post('/api/suppliers', (req, res) => {
   const { name, contact, email, address } = req.body;
   if (!name) return res.status(400).json({ error: 'Supplier name required' });
-  db.run('INSERT INTO suppliers (name,contact,email,address) VALUES (?,?,?,?)',
-    [name, contact || '', email || '', address || ''], function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true, id: this.lastID });
-  });
+  query('INSERT INTO suppliers (name,contact,email,address) VALUES ($1,$2,$3,$4) RETURNING id',
+    [name, contact || '', email || '', address || ''])
+    .then(result => res.json({ success: true, id: result.rows[0].id }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.put('/api/suppliers/:id', (req, res) => {
   const { name, contact, email, address } = req.body;
-  db.run('UPDATE suppliers SET name=COALESCE(?,name), contact=COALESCE(?,contact), email=COALESCE(?,email), address=COALESCE(?,address) WHERE id=?',
-    [name, contact, email, address, req.params.id], function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true });
-  });
+  query('UPDATE suppliers SET name=COALESCE($1,name), contact=COALESCE($2,contact), email=COALESCE($3,email), address=COALESCE($4,address) WHERE id=$5',
+    [name, contact, email, address, req.params.id])
+    .then(() => res.json({ success: true }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.delete('/api/suppliers/:id', (req, res) => {
-  db.run('DELETE FROM suppliers WHERE id=?', [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
-  });
+  query('DELETE FROM suppliers WHERE id=$1', [req.params.id])
+    .then(() => res.json({ success: true }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 // REPAIRS
 app.get('/api/repairs', (req, res) => {
   const { customer_id } = req.query;
-  let query = `SELECT r.*, u.name as customer_name, t.name as technician_name
+  let q = `SELECT r.*, u.name as customer_name, t.name as technician_name
     FROM repairs r
     LEFT JOIN users u ON r.customer_id = u.id
     LEFT JOIN users t ON r.technician_id = t.id`;
   const params = [];
-  if (customer_id) { query += ' WHERE r.customer_id = ?'; params.push(customer_id); }
-  query += ' ORDER BY r.created_at DESC';
-  db.all(query, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+  if (customer_id) { q += ' WHERE r.customer_id = $1'; params.push(customer_id); }
+  q += ' ORDER BY r.created_at DESC';
+  query(q, params)
+    .then(result => res.json(result.rows))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.get('/api/repairs/:id', (req, res) => {
-  db.get(`SELECT r.*, u.name as customer_name, u.email as customer_email, t.name as technician_name
+  query(`SELECT r.*, u.name as customer_name, u.email as customer_email, t.name as technician_name
     FROM repairs r LEFT JOIN users u ON r.customer_id = u.id LEFT JOIN users t ON r.technician_id = t.id
-    WHERE r.id=?`, [req.params.id], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'Not found' });
-    res.json(row);
-  });
+    WHERE r.id=$1`, [req.params.id])
+    .then(result => {
+      const row = result.rows[0];
+      if (!row) return res.status(404).json({ error: 'Not found' });
+      res.json(row);
+    })
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.post('/api/repairs', (req, res) => {
   const { customer_id, device_model, problem_description } = req.body;
-  db.run('INSERT INTO repairs (customer_id,device_model,problem_description) VALUES (?,?,?)',
-    [customer_id, device_model, problem_description], function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID, status: 'Pending' });
-  });
+  query('INSERT INTO repairs (customer_id,device_model,problem_description) VALUES ($1,$2,$3) RETURNING id',
+    [customer_id, device_model, problem_description])
+    .then(result => res.json({ id: result.rows[0].id, status: 'Pending' }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.put('/api/repairs/:id', (req, res) => {
   const { status, technician_id, cost, notes } = req.body;
-  db.run('UPDATE repairs SET status=COALESCE(?,status), technician_id=COALESCE(?,technician_id), cost=COALESCE(?,cost), notes=COALESCE(?,notes) WHERE id=?',
-    [status, technician_id, cost, notes, req.params.id], function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true });
-  });
+  query('UPDATE repairs SET status=COALESCE($1,status), technician_id=COALESCE($2,technician_id), cost=COALESCE($3,cost), notes=COALESCE($4,notes) WHERE id=$5',
+    [status, technician_id, cost, notes, req.params.id])
+    .then(() => res.json({ success: true }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.put('/api/repairs/:id/assign', (req, res) => {
   const { technician_id } = req.body;
-  db.run('UPDATE repairs SET technician_id=? WHERE id=?', [technician_id, req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
-  });
+  query('UPDATE repairs SET technician_id=$1 WHERE id=$2', [technician_id, req.params.id])
+    .then(() => res.json({ success: true }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 // AI DIAGNOSIS
 app.get('/api/ai-diagnose/:repairId', (req, res) => {
-  db.get('SELECT problem_description FROM repairs WHERE id=?', [req.params.repairId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'Repair not found' });
-    res.json({ diagnosis: aiDiagnose(row.problem_description) });
-  });
+  query('SELECT problem_description FROM repairs WHERE id=$1', [req.params.repairId])
+    .then(result => {
+      const row = result.rows[0];
+      if (!row) return res.status(404).json({ error: 'Repair not found' });
+      res.json({ diagnosis: aiDiagnose(row.problem_description) });
+    })
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 // ANALYTICS
 app.get('/api/analytics', (req, res) => {
-  db.get("SELECT COUNT(*) as totalRepairs, COALESCE(SUM(cost),0) as totalIncome FROM repairs WHERE status='Completed'", [], (err, completedRow) => {
-    db.get("SELECT COUNT(*) as pendingRepairs FROM repairs WHERE status NOT IN ('Completed','Cancelled')", [], (err, pendingRow) => {
-      db.all("SELECT problem_description as problem, COUNT(*) as count FROM repairs GROUP BY problem_description ORDER BY count DESC LIMIT 5", [], (err, commonRows) => {
-        db.all(`SELECT date(created_at) as day, COUNT(*) as count, COALESCE(SUM(cost),0) as income
-          FROM repairs WHERE status='Completed' AND created_at >= date('now','-7 days')
-          GROUP BY date(created_at) ORDER BY day ASC`, [], (err, weeklyRows) => {
-          db.get("SELECT COUNT(*) as c FROM users WHERE role='customer'", [], (err, custRow) => {
-            db.get("SELECT COUNT(*) as c FROM users WHERE role='technician'", [], (err, techRow) => {
-              res.json({
-                totalRepairsCompleted: completedRow.totalRepairs || 0,
-                totalIncome: completedRow.totalIncome || 0,
-                pendingRepairs: pendingRow.pendingRepairs || 0,
-                totalCustomers: custRow.c || 0,
-                totalTechnicians: techRow.c || 0,
-                commonProblems: commonRows || [],
-                weeklyData: weeklyRows || []
-              });
-            });
-          });
-        });
-      });
+  Promise.all([
+    query("SELECT COUNT(*) as totalRepairs, COALESCE(SUM(cost),0) as totalIncome FROM repairs WHERE status='Completed'"),
+    query("SELECT COUNT(*) as pendingRepairs FROM repairs WHERE status NOT IN ('Completed','Cancelled')"),
+    query("SELECT problem_description as problem, COUNT(*) as count FROM repairs GROUP BY problem_description ORDER BY count DESC LIMIT 5"),
+    query(`SELECT to_char(created_at, 'YYYY-MM-DD') as day, COUNT(*) as count, COALESCE(SUM(cost),0) as income
+      FROM repairs WHERE status='Completed' AND created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY to_char(created_at, 'YYYY-MM-DD') ORDER BY day ASC`),
+    query("SELECT COUNT(*) as c FROM users WHERE role='customer'"),
+    query("SELECT COUNT(*) as c FROM users WHERE role='technician'")
+  ]).then(([completed, pending, common, weekly, cust, tech]) => {
+    res.json({
+      totalRepairsCompleted: completed.rows[0].totalrepairs || 0,
+      totalIncome: completed.rows[0].totalincome || 0,
+      pendingRepairs: pending.rows[0].pendingrepairs || 0,
+      totalCustomers: cust.rows[0].c || 0,
+      totalTechnicians: tech.rows[0].c || 0,
+      commonProblems: common.rows || [],
+      weeklyData: weekly.rows || []
     });
-  });
+  }).catch(err => res.status(500).json({ error: err.message }));
 });
 
 // USERS (Admin)
 app.get('/api/users', (req, res) => {
-  db.all('SELECT id,name,email,role FROM users ORDER BY role,name', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+  query('SELECT id,name,email,role FROM users ORDER BY role,name')
+    .then(result => res.json(result.rows))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.post('/api/users', async (req, res) => {
   const { name, email, password, role } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
   const hashed = await bcrypt.hash(password, SALT_ROUNDS);
-  db.run('INSERT INTO users (name,email,password,role) VALUES (?,?,?,?)',
-    [name, email, hashed, role], function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true, id: this.lastID });
-  });
+  query('INSERT INTO users (name,email,password,role) VALUES ($1,$2,$3,$4) RETURNING id',
+    [name, email, hashed, role])
+    .then(result => res.json({ success: true, id: result.rows[0].id }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.delete('/api/users/:id', (req, res) => {
-  db.run('DELETE FROM users WHERE id=?', [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
-  });
+  query('DELETE FROM users WHERE id=$1', [req.params.id])
+    .then(() => res.json({ success: true }))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 // ─── EXCEL EXPORTS ────────────────────────────────────────
@@ -329,31 +258,28 @@ function sendExcel(res, data, sheetName, fileName) {
 }
 
 app.get('/api/export/repairs', (req, res) => {
-  db.all(`SELECT r.id as "Repair ID", u.name as "Customer", r.device_model as "Device",
+  query(`SELECT r.id as "Repair ID", u.name as "Customer", r.device_model as "Device",
     r.problem_description as "Problem", r.status as "Status",
     r.cost as "Cost ($)", t.name as "Technician", r.notes as "Notes",
     r.created_at as "Date"
     FROM repairs r LEFT JOIN users u ON r.customer_id=u.id LEFT JOIN users t ON r.technician_id=t.id
-    ORDER BY r.created_at DESC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    sendExcel(res, rows, 'Repairs', 'SLR_Repairs_Report');
-  });
+    ORDER BY r.created_at DESC`)
+    .then(result => sendExcel(res, result.rows, 'Repairs', 'SLR_Repairs_Report'))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.get('/api/export/parts', (req, res) => {
-  db.all(`SELECT p.id as "Part ID", p.name as "Part Name", p.stock_level as "Stock",
+  query(`SELECT p.id as "Part ID", p.name as "Part Name", p.stock_level as "Stock",
     p.cost as "Unit Cost ($)", s.name as "Supplier"
-    FROM parts p LEFT JOIN suppliers s ON p.supplier_id=s.id ORDER BY p.name`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    sendExcel(res, rows, 'Parts Inventory', 'SLR_Parts_Inventory');
-  });
+    FROM parts p LEFT JOIN suppliers s ON p.supplier_id=s.id ORDER BY p.name`)
+    .then(result => sendExcel(res, result.rows, 'Parts Inventory', 'SLR_Parts_Inventory'))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.get('/api/export/suppliers', (req, res) => {
-  db.all(`SELECT id as "ID", name as "Supplier Name", contact as "Contact", email as "Email", address as "Address" FROM suppliers ORDER BY name`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    sendExcel(res, rows, 'Suppliers', 'SLR_Suppliers');
-  });
+  query(`SELECT id as "ID", name as "Supplier Name", contact as "Contact", email as "Email", address as "Address" FROM suppliers ORDER BY name`)
+    .then(result => sendExcel(res, result.rows, 'Suppliers', 'SLR_Suppliers'))
+    .catch(err => res.status(500).json({ error: err.message }));
 });
 
 app.listen(PORT, () => console.log(`🚀 SLR server running on port ${PORT}`));
